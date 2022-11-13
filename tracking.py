@@ -1,19 +1,20 @@
-from vidgear.gears import NetGear
-import cv2
-from matplotlib import pyplot as plt
-from tflite_support.task import vision
-from tflite_support.task import core
-from tflite_support.task import processor
-import numpy as np
-import pantilthat as pth
+import signal
+import sys
 import time
 from multiprocessing import Manager
 from multiprocessing import Process
-import signal
-import sys
+
+import click
+import cv2
+import numpy as np
+import pantilthat as pth
+from tflite_support.task import vision
+from tflite_support.task import core
+from tflite_support.task import processor
+from vidgear.gears import NetGear
+
 
 SERVO_RANGE = (-90, 90)
-
 
 class PID:
     def __init__(self, kP=1, kI=0, kD=0):
@@ -45,39 +46,44 @@ class PID:
 class Detector:
     def __init__(self, 
                  model='models/lite-model_efficientdet_lite0_detection_metadata_1.tflite', 
-                 backSub = cv2.createBackgroundSubtractorMOG2(),
-                 area_threshold=50):
+                 label=None,
+                 max_results=3,
+                 score_threshold=.5,
+                 history=50,
+                 area_threshold=200):
         base_options = core.BaseOptions(file_name=model, use_coral=True)
         detection_options = processor.DetectionOptions(
-            max_results=3, 
-            score_threshold=0.5)
+            max_results=max_results, 
+            score_threshold=score_threshold)
         options = vision.ObjectDetectorOptions(
             base_options=base_options, 
             detection_options=detection_options)
         detector = vision.ObjectDetector.create_from_options(options)
         self.detector = detector
-        self.backSub = backSub
+        self.backSub = cv2.createBackgroundSubtractorMOG2(history=history, 
+                                                          detectShadows=False)
         self.background = None
         self.prev_frames = []
         self.area_threshold = area_threshold
+        self.label = label
         
     def update_background(self, frame):
         if self.background is None:
             self.background = frame
             return
         
-        self.background = cv2.accumulateWeighted(frame, self.background.astype(float), 0.5).astype(np.uint8)
+        self.background = cv2.accumulateWeighted(frame, self.background.astype(float), 0.8).astype(np.uint8)
     
     def detect_obj(self, frame):
         im = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)    
         input_tensor = vision.TensorImage.create_from_array(im)
         results = self.detector.detect(input_tensor)
         
-        max_area = 0
+        max_score = 0
         center = frame.shape[1]//2, frame.shape[0]//2
         w, h = None, None
         for res in results.detections:
-            if res.categories[0].category_name == 'person':
+            if self.label is None or res.categories[0].category_name == self.label:
                 bb = res.bounding_box
                 x = bb.origin_x
                 y = bb.origin_y
@@ -89,8 +95,8 @@ class Detector:
                 cv2.rectangle(im, (x, y), (x2, y2), color=(0, 255, 0), thickness=3)
                 cv2.putText(im, label, (x + 12, y + 12), 0, 1e-3 * im.shape[0], (0, 255, 0))
                 
-                if w * h > max_area:
-                    max_area = w * h
+                if res.categories[0].score > max_score:
+                    max_score = res.categories[0].score
                     center = x+w//2, y+h//2
         return im, (center, w, h)
     
@@ -145,15 +151,20 @@ def signal_handler(sig, frame):
 	pth.servo_enable(2, False)
 	sys.exit()
 
-def detect_process(objX, objY, centerX, centerY):
+def detect_process(config, objX, objY, centerX, centerY):
     stream = cv2.VideoCapture(0)
-    stream.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-    stream.set(cv2.CAP_PROP_FRAME_HEIGHT, 320)
+    res = config.get('resolution', (320, 320))
+    port = config.get('port', '5454')
+    ip = config['ip']
+    mode = config.get('mode', 'obj')
+    
+    stream.set(cv2.CAP_PROP_FRAME_WIDTH, res[0])
+    stream.set(cv2.CAP_PROP_FRAME_HEIGHT, res[1])
     options = {"flag": 0, "copy": False, "track": False}
 
     server = NetGear(
-        address="192.168.68.122",
-        port="5454",
+        address=ip,
+        port=port,
         protocol="tcp",
         pattern=0,
         logging=True,
@@ -167,15 +178,10 @@ def detect_process(objX, objY, centerX, centerY):
         stream.release()
         server.close()
         sys.exit()
+    
     signal.signal(signal.SIGINT, signal_handler)
     
-    # model = 'models/lite-model_object_detection_mobile_object_localizer_v1_1_metadata_2.tflite' 
-    # model = 'models/squirrel.tflite'
-    # model = 'models/mobilenet_v2.tflite'
-    model = 'models/lite-model_efficientdet_lite0_detection_metadata_1.tflite'
-    backSub = cv2.createBackgroundSubtractorMOG2(history=50, 
-                                                 detectShadows=False)
-    detector = Detector(model, backSub, 200)
+    detector = Detector(**config['params'])
     while True:
         try:
             # read frames from stream
@@ -185,18 +191,15 @@ def detect_process(objX, objY, centerX, centerY):
                 break
             frame = cv2.flip(frame, -1)
             
-            # H, W = frame.shape[:2]
-            # centerX.value = W // 2
-            # centerY.value = H // 2
+            if mode == 'obj':
+                im, pos = detector.detect_obj(frame)
+            else:
+                detector.update_background(frame)
+                im, pos = detector.detect_mvmt(frame)
             
-            detector.update_background(frame)
-            # im, pos = detector.detect_mvmt(frame)
-            im, pos = detector.detect_obj(frame)
             center, w, h = pos
-            print(center)
+            # print(center)
             objX.value, objY.value = center
-            # im = detector.detect_mvmt(frame, method='naive')
-            
             server.send(im)
         except KeyboardInterrupt:
             break
@@ -209,8 +212,10 @@ def pid_process(output, p, i, d, coord, center, action):
     while True:
         error = center.value - coord.value
         output.value = pid.update(error)
-        if action == 'pan':
-            print(f'{action} error {error} angle: {output.value} coords: {center.value, coord.value} vals: {pid.cP, pid.kP, pid.cI, pid.kI, pid.cD, pid.kD}')
+        # if action == 'pan':
+        #     coords = center.value, coord.value
+        #     vals = [pid.cP, pid.kP, pid.cI, pid.kI, pid.cD, pid.kD]
+        #     print(f'{action} error {error} angle: {output.value} coords: {coords} vals: {vals}')
     
 def in_range(val, start, end):
     # determine the input value is in the supplied range
@@ -230,45 +235,98 @@ def set_servos(pan, tlt):
         # if the tilt angle is within the range, tilt
         if in_range(tiltAngle, SERVO_RANGE[0], SERVO_RANGE[1]):
             pth.tilt(tiltAngle)
-            
-with Manager() as manager:
-    pth.servo_enable(1, True)
-    pth.servo_enable(2, True)
-    # set integer values for the object center (x, y)-coordinates
-    centerX = manager.Value("i", 160)
-    centerY = manager.Value("i", 160)
-    # set integer values for the object's (x, y)-coordinates
-    objX = manager.Value("i", 0)
-    objY = manager.Value("i", 0)
-    # pan and tilt values will be managed by independed PIDs
-    pan = manager.Value("i", 0)
-    tlt = manager.Value("i", 0)
-    # set PID values for panning
-    panP = manager.Value("f", 0.08)
-    panI = manager.Value("f", 0.1)
-    panD = manager.Value("f", 0.005)
-    # set PID values for tilting
-    tiltP = manager.Value("f", 0.15)
-    tiltI = manager.Value("f", 0.15)
-    tiltD = manager.Value("f", 0.005)
+
+@click.command()
+@click.option('--width', default=320,
+              help='Resolution of video.')
+@click.option('--height', default=320,
+              help='Resolution of video.')
+@click.option('--ip', default='192.168.68.122',
+              help='Address to stream to.')
+@click.option('--port', default='5454',
+              help='TCP port used for streaming.')
+@click.option('--mode', type=click.Choice(['obj', 'motion']), default='obj',
+              help='Object detection vs. motion detection.')
+@click.option('--model', default='models/lite-model_efficientdet_lite0_detection_metadata_1.tflite',
+              help='Path to tflite model. Only used in obj mode.')
+@click.option('--label', default=None,
+              help='Class label to detect. Leave empty for all classes. Only used in obj mode.')
+@click.option('--max_results', default=3,
+              help='Max objects to detect. Only used in obj mode.')
+@click.option('--score_threshold', default=.5,
+              help='Scoring threshold for object detector. Only used in obj mode.')
+@click.option('--history', default=50,
+              help='Frames for background subtractor to remember. Only used in motion mode.')
+@click.option('--area_threshold', default=200,
+              help='Threshold for bounding box areas. Only used in motion mode.')
+def track(width, height, ip, port, mode, model, label,
+          max_results, score_threshold, history, area_threshold):
+    if mode == 'obj':
+        params = {
+            'model': model,
+            'label': label,
+            'max_results': max_results,
+            'score_threshold': score_threshold
+        }
+    else:
+        params = {
+            'history': history,
+            'area_threshold': area_threshold,
+        }
+    config = {
+        'resolution': (width, height),
+        'ip': ip,
+        'port': port,
+        'mode': mode,
+        'params': params
+    }
     
-    processObjectCenter = Process(target=detect_process, 
-                                  args=(objX, objY, centerX, centerY))
-    processPanning = Process(target=pid_process, 
-                             args=(pan, panP, panI, panD, objX, centerX, 'pan'))
-    processTilting = Process(target=pid_process, 
-                             args=(tlt, tiltP, tiltI, tiltD, objY, centerY, 'tilt'))
-    processSetServos = Process(target=set_servos, args=(pan, tlt))
-    # start all 4 processes
-    processObjectCenter.start()
-    processPanning.start()
-    processTilting.start()
-    processSetServos.start()
-    # join all 4 processes
-    processObjectCenter.join()
-    processPanning.join()
-    processTilting.join()
-    processSetServos.join()
-    # disable the servos
-    pth.servo_enable(1, False)
-    pth.servo_enable(2, False)
+    with Manager() as manager:
+        pth.servo_enable(1, True)
+        pth.servo_enable(2, True)
+        # set integer values for the object center (x, y)-coordinates
+        centerX = manager.Value("i", 160)
+        centerY = manager.Value("i", 160)
+        # set integer values for the object's (x, y)-coordinates
+        objX = manager.Value("i", 0)
+        objY = manager.Value("i", 0)
+        # pan and tilt values will be managed by independed PIDs
+        pan = manager.Value("i", 0)
+        tlt = manager.Value("i", 0)
+        # set PID values for panning
+        panP = manager.Value("f", 0.08)
+        panI = manager.Value("f", 0.1)
+        panD = manager.Value("f", 0.005)
+        # set PID values for tilting
+        tiltP = manager.Value("f", 0.15)
+        tiltI = manager.Value("f", 0.15)
+        tiltD = manager.Value("f", 0.005)
+        
+        if mode == 'motion':
+            processObjectCenter = Process(target=detect_process, 
+                                        args=(config, objX, objY, centerX, centerY))
+            processObjectCenter.start()
+        else:
+            processObjectCenter = Process(target=detect_process, 
+                                          args=(config, objX, objY, centerX, centerY))
+            processPanning = Process(target=pid_process, 
+                                     args=(pan, panP, panI, panD, objX, centerX, 'pan'))
+            processTilting = Process(target=pid_process, 
+                                     args=(tlt, tiltP, tiltI, tiltD, objY, centerY, 'tilt'))
+            processSetServos = Process(target=set_servos, args=(pan, tlt))
+            # start all 4 processes
+            processObjectCenter.start()
+            processPanning.start()
+            processTilting.start()
+            processSetServos.start()
+            # join all 4 processes
+            processObjectCenter.join()
+            processPanning.join()
+            processTilting.join()
+            processSetServos.join()
+            # disable the servos
+            pth.servo_enable(1, False)
+            pth.servo_enable(2, False)
+
+if __name__ == '__main__':
+    track()
