@@ -8,9 +8,14 @@ import click
 import cv2
 import numpy as np
 import pantilthat as pth
+import yaml
+from ctypes import c_wchar_p
+from pushbullet import Pushbullet
+from tabulate import tabulate
 from tflite_support.task import vision
 from tflite_support.task import core
 from tflite_support.task import processor
+from twilio.rest import Client
 from vidgear.gears import NetGear
 
 
@@ -98,7 +103,10 @@ class Detector:
                 if res.categories[0].score > max_score:
                     max_score = res.categories[0].score
                     center = x+w//2, y+h//2
-        return im, (center, w, h)
+        detected = [(res.categories[0].category_name, res.categories[0].score) for res 
+                    in results.detections if res.categories[0].category_name == self.label]
+        message = '' if len(detected) == 0 else f'Detected:\n{tabulate(detected)}'
+        return im, (center, w, h), message
     
     def get_foreground_mask(self, frame, disp=False):
         mask = self.backSub.apply(frame)
@@ -144,6 +152,27 @@ class Detector:
             x, y, w, h = largest
             cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
         return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), (center, w, h)
+
+class Notifier:
+    def __init__(self, creds):
+        self.smsclient = Client(creds['twilio']['account_id'], creds['twilio']['token'])
+        self.pushbullet = Pushbullet(creds['pushbullet']['token'])
+        self.creds = creds
+        
+    def send_notif(self, message, mode='push', recipients=[]):
+        if mode == 'sms':
+            client = self.smsclient
+            for recipient in recipients:
+                msg = client.messages.create(
+                    to=recipient,
+                    from_=self.creds['twilio']['sender'],
+                    body=message
+                )
+        elif mode == 'push':
+            self.pushbullet.push_note('Object detected', message)
+        else:
+            raise ValueError('mode must be "sms" or "push"!')
+        return time.time()
        
 def signal_handler(sig, frame):
 	print("[INFO] You pressed `ctrl + c`! Exiting...")
@@ -151,32 +180,35 @@ def signal_handler(sig, frame):
 	pth.servo_enable(2, False)
 	sys.exit()
 
-def detect_process(config, objX, objY, centerX, centerY):
+def detect_process(config, objX, objY, centerX, centerY, objDetected):
     stream = cv2.VideoCapture(0)
     res = config.get('resolution', (320, 320))
     port = config.get('port', '5454')
     ip = config['ip']
     mode = config.get('mode', 'obj')
+    stream_video = config.get('stream_video', False)
     
     stream.set(cv2.CAP_PROP_FRAME_WIDTH, res[0])
     stream.set(cv2.CAP_PROP_FRAME_HEIGHT, res[1])
     options = {"flag": 0, "copy": False, "track": False}
 
-    server = NetGear(
-        address=ip,
-        port=port,
-        protocol="tcp",
-        pattern=0,
-        logging=True,
-        **options
-    )
+    if stream_video:
+        server = NetGear(
+            address=ip,
+            port=port,
+            protocol="tcp",
+            pattern=0,
+            logging=False,
+            **options
+        )
     
     def signal_handler(sig, frame):
         print("[INFO] You pressed `ctrl + c`! Exiting...")
         pth.servo_enable(1, False)
         pth.servo_enable(2, False)
         stream.release()
-        server.close()
+        if stream_video:
+            server.close()
         sys.exit()
     
     signal.signal(signal.SIGINT, signal_handler)
@@ -192,7 +224,8 @@ def detect_process(config, objX, objY, centerX, centerY):
             frame = cv2.flip(frame, -1)
             
             if mode == 'obj':
-                im, pos = detector.detect_obj(frame)
+                im, pos, msg = detector.detect_obj(frame)
+                objDetected.value = msg
             else:
                 detector.update_background(frame)
                 im, pos = detector.detect_mvmt(frame)
@@ -200,7 +233,8 @@ def detect_process(config, objX, objY, centerX, centerY):
             center, w, h = pos
             # print(center)
             objX.value, objY.value = center
-            server.send(im)
+            if stream_video:
+                server.send(im)
         except KeyboardInterrupt:
             break
 
@@ -236,6 +270,13 @@ def set_servos(pan, tlt):
         if in_range(tiltAngle, SERVO_RANGE[0], SERVO_RANGE[1]):
             pth.tilt(tiltAngle)
 
+def notify(objDetected, notifier, mode='sms', recipients=[], second_threshold=60):
+    sent = None
+    while True:
+        if len(objDetected.value) > 0:
+            if sent is None or time.time() - sent > second_threshold:
+                sent = notifier.send_notif(objDetected.value, mode, recipients)
+
 @click.command()
 @click.option('--width', default=320,
               help='Resolution of video.')
@@ -259,8 +300,23 @@ def set_servos(pan, tlt):
               help='Frames for background subtractor to remember. Only used in motion mode.')
 @click.option('--area_threshold', default=200,
               help='Threshold for bounding box areas. Only used in motion mode.')
+@click.option('--stream', default=False,
+              help='Whether to stream to given address or not.')
+@click.option('--notif', type=click.Choice(['', 'sms', 'push']), default='',
+              help='SMS or push notifications.')
+@click.option('--sms_recipients', '-sms', multiple=True, default=None,
+              help='#s to send SMS notifs to.')
+@click.option('--seconds', default=60,
+              help='Minimum seconds b/w notifications.')
 def track(width, height, ip, port, mode, model, label,
-          max_results, score_threshold, history, area_threshold):
+          max_results, score_threshold, history, area_threshold, stream, 
+          notif, sms_recipients, seconds):
+    
+    if notif:
+        with open('creds.yml', 'r') as f:
+            creds = yaml.safe_load(f)
+        notifier = Notifier(creds)
+    
     if mode == 'obj':
         params = {
             'model': model,
@@ -278,7 +334,8 @@ def track(width, height, ip, port, mode, model, label,
         'ip': ip,
         'port': port,
         'mode': mode,
-        'params': params
+        'params': params,
+        'stream_video': stream
     }
     
     with Manager() as manager:
@@ -301,30 +358,42 @@ def track(width, height, ip, port, mode, model, label,
         tiltP = manager.Value("f", 0.15)
         tiltI = manager.Value("f", 0.15)
         tiltD = manager.Value("f", 0.005)
+        # detections
+        objDetected = manager.Value(c_wchar_p, '')
         
         if mode == 'motion':
-            processObjectCenter = Process(target=detect_process, 
-                                        args=(config, objX, objY, centerX, centerY))
+            processObjectCenter = Process(
+                target=detect_process, 
+                args=(config, objX, objY, centerX, centerY, objDetected))
             processObjectCenter.start()
         else:
-            processObjectCenter = Process(target=detect_process, 
-                                          args=(config, objX, objY, centerX, centerY))
+            processObjectCenter = Process(
+                target=detect_process, 
+                args=(config, objX, objY, centerX, centerY, objDetected))
+            if notif:
+                processNotification = Process(
+                    target=notify, 
+                    args=(objDetected, notifier, notif, sms_recipients, seconds))
             processPanning = Process(target=pid_process, 
                                      args=(pan, panP, panI, panD, objX, centerX, 'pan'))
             processTilting = Process(target=pid_process, 
                                      args=(tlt, tiltP, tiltI, tiltD, objY, centerY, 'tilt'))
             processSetServos = Process(target=set_servos, args=(pan, tlt))
-            # start all 4 processes
+            
             processObjectCenter.start()
+            if notif:
+                processNotification.start()
             processPanning.start()
             processTilting.start()
             processSetServos.start()
-            # join all 4 processes
+            
             processObjectCenter.join()
+            if notif:
+                processNotification.join()
             processPanning.join()
             processTilting.join()
             processSetServos.join()
-            # disable the servos
+            
             pth.servo_enable(1, False)
             pth.servo_enable(2, False)
 
