@@ -105,7 +105,7 @@ class Detector:
                     center = x+w//2, y+h//2
         detected = [(res.categories[0].category_name, res.categories[0].score) for res 
                     in results.detections if res.categories[0].category_name == self.label]
-        message = '' if len(detected) == 0 else f'Detected:\n{tabulate(detected)}'
+        message = None if len(detected) == 0 else f'Detected:\n{tabulate(detected)}'
         return im, (center, w, h), message
     
     def get_foreground_mask(self, frame, disp=False):
@@ -140,10 +140,12 @@ class Detector:
         center = frame.shape[1]//2, frame.shape[0]//2
         w, h = None, None
         largest = None
+        msg = None
         for contour in contours:
             # if cv2.contourArea(contour) > self.area_threshold:
             (x, y, w, h) = cv2.boundingRect(contour)
-            if w * h > self.area_threshold:
+            # TODO: replace 320
+            if w * h > self.area_threshold and w * h < 320**2:
                 largest = x, y, w, h
                 if w * h > max_area:
                     max_area = w * h
@@ -151,7 +153,8 @@ class Detector:
         if largest:
             x, y, w, h = largest
             cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), (center, w, h)
+            msg = f'Movement detected: {x, y, w, h}'
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), (center, w, h), msg
 
 class Notifier:
     def __init__(self, creds):
@@ -228,10 +231,10 @@ def detect_process(config, objX, objY, centerX, centerY, objDetected):
                 objDetected.value = msg
             else:
                 detector.update_background(frame)
-                im, pos = detector.detect_mvmt(frame)
+                im, pos, msg = detector.detect_mvmt(frame)
+                objDetected.value = msg
             
             center, w, h = pos
-            # print(center)
             objX.value, objY.value = center
             if stream_video:
                 server.send(im)
@@ -273,7 +276,7 @@ def set_servos(pan, tlt):
 def notify(objDetected, notifier, mode='sms', recipients=[], second_threshold=60):
     sent = None
     while True:
-        if len(objDetected.value) > 0:
+        if objDetected and objDetected.value:
             if sent is None or time.time() - sent > second_threshold:
                 sent = notifier.send_notif(objDetected.value, mode, recipients)
 
@@ -365,7 +368,18 @@ def track(width, height, ip, port, mode, model, label,
             processObjectCenter = Process(
                 target=detect_process, 
                 args=(config, objX, objY, centerX, centerY, objDetected))
+            if notif:
+                processNotification = Process(
+                    target=notify, 
+                    args=(objDetected, notifier, notif, sms_recipients, seconds))
+                
             processObjectCenter.start()
+            if notif:
+                processNotification.start()
+                
+            processObjectCenter.join()
+            if notif:
+                processNotification.join()
         else:
             processObjectCenter = Process(
                 target=detect_process, 
